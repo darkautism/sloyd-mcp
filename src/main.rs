@@ -8,7 +8,29 @@ use sloyd_mcp::{
     mcp::SloydMcp,
     service::Service,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
+
+fn config_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(path).join("sloyd-mcp");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".config/sloyd-mcp");
+    }
+    PathBuf::from(".config/sloyd-mcp")
+}
+
+fn default_cookie_path() -> PathBuf {
+    config_dir().join("cookies.json")
+}
+
+fn default_profile_path() -> PathBuf {
+    config_dir().join("chromium")
+}
+
+fn default_cache_path() -> PathBuf {
+    config_dir().join("cache")
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Engine {
@@ -29,13 +51,13 @@ struct Cli {
     #[arg(long, default_value = "/usr/bin/chromium")]
     chromium: PathBuf,
 
-    #[arg(long, default_value = "/root/sloyd-mcp/state/chromium")]
+    #[arg(long, default_value_os_t = default_profile_path())]
     profile: PathBuf,
 
-    #[arg(long, default_value = "/root/sloyd-mcp/state/cookies.json")]
+    #[arg(long, default_value_os_t = default_cookie_path())]
     cookies: PathBuf,
 
-    #[arg(long, default_value = "/root/sloyd-mcp/state/cache")]
+    #[arg(long, default_value_os_t = default_cache_path())]
     cache: PathBuf,
 
     #[arg(long, default_value_t = 9232)]
