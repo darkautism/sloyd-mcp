@@ -1,8 +1,6 @@
 /target
 /bin/*
 !/bin/.gitkeep
-/state/*
-!/state/.gitkeep
 /downloads/*
 !/downloads/.gitkeep
 .env
