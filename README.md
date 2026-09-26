@@ -66,13 +66,13 @@ Import the cookie JSON exported from the browser:
 ./target/release/sloyd-mcp import-cookies /path/to/sloyd-cookies.json
 ```
 
-The normalized file is stored at:
+The normalized file is stored at the standard per-user config path (or `$XDG_CONFIG_HOME/sloyd-mcp/cookies.json` when `XDG_CONFIG_HOME` is set):
 
 ```text
-/root/sloyd-mcp/state/cookies.json
+~/.config/sloyd-mcp/cookies.json
 ```
 
-with Unix mode `0600`.
+with Unix mode `0600`. Browser fallback state also lives under `~/.config/sloyd-mcp/` (`chromium/` and `cache/`).
 
 Verify silent login without starting a browser:
 
