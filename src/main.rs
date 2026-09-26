@@ -162,6 +162,12 @@ async fn main() -> Result<()> {
             let imported = import_cookie_file(source).await?;
             if let Some(parent) = cli.cookies.parent() {
                 tokio::fs::create_dir_all(parent).await?;
+                #[cfg(unix)]
+                if cli.cookies == default_cookie_path() {
+                    use std::os::unix::fs::PermissionsExt;
+                    tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                        .await?;
+                }
             }
             tokio::fs::write(&cli.cookies, serde_json::to_vec_pretty(&imported.cookies)?).await?;
             #[cfg(unix)]
