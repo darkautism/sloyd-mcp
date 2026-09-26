@@ -1,9 +1,14 @@
 use crate::{
     backend::Backend,
-    types::{GenerateRequest, Job, JobStatus},
+    types::{GenerateRequest, Job, JobStatus, POLYCOUNTS},
 };
 use anyhow::{Context, Result, bail};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
@@ -11,6 +16,18 @@ struct Entry {
     request: GenerateRequest,
     remote_id: Option<String>,
     status: JobStatus,
+    created: Instant,
+}
+
+impl Entry {
+    fn job(&self, id: Uuid) -> Job {
+        Job {
+            id,
+            status: self.status.clone(),
+            request: self.request.clone(),
+            elapsed_secs: self.created.elapsed().as_secs(),
+        }
+    }
 }
 
 pub struct Service<B: Backend + Send + 'static> {
@@ -40,34 +57,74 @@ impl<B: Backend + Send + 'static> Service<B> {
                 request: request.clone(),
                 remote_id: None,
                 status: JobStatus::Queued,
+                created: Instant::now(),
             },
         );
         self.spawn(id, false);
-        Ok(Job {
-            id,
-            status: JobStatus::Queued,
-        })
+        self.status(id, Duration::ZERO).await
     }
 
-    pub async fn status(&self, id: Uuid) -> Result<Job> {
+    /// Returns the job, first waiting up to `wait` for it to finish.
+    pub async fn status(&self, id: Uuid, wait: Duration) -> Result<Job> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let job = {
+                let j = self.jobs.lock().await;
+                j.get(&id)
+                    .with_context(|| format!("unknown job id {id}; call `list` to see known jobs"))?
+                    .job(id)
+            };
+            if job.status.is_terminal() || Instant::now() >= deadline {
+                return Ok(job);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    pub async fn list(&self) -> Vec<Job> {
         let j = self.jobs.lock().await;
-        let e = j.get(&id).context("unknown job")?;
-        Ok(Job {
-            id,
-            status: e.status.clone(),
-        })
+        let mut jobs: Vec<Job> = j.iter().map(|(id, e)| e.job(*id)).collect();
+        jobs.sort_by_key(|x| std::cmp::Reverse(x.elapsed_secs));
+        jobs
     }
 
-    pub async fn download(&self, id: Uuid, out: &Path) -> Result<()> {
+    /// Waits up to `wait` for completion, then writes the GLB. Returns the absolute path.
+    pub async fn download(
+        &self,
+        id: Uuid,
+        out: Option<PathBuf>,
+        wait: Duration,
+    ) -> Result<PathBuf> {
+        let job = self.status(id, wait).await?;
+        match &job.status {
+            JobStatus::Completed => {}
+            JobStatus::Failed { message } => {
+                bail!("job failed: {message}; call `retry` to resubmit it")
+            }
+            _ => bail!(
+                "job is still {} after waiting {}s; call `download` again to keep waiting",
+                if matches!(job.status, JobStatus::Queued) {
+                    "queued"
+                } else {
+                    "running"
+                },
+                wait.as_secs()
+            ),
+        }
         let remote = {
             let j = self.jobs.lock().await;
-            let e = j.get(&id).context("unknown job")?;
-            if !matches!(e.status, JobStatus::Completed) {
-                bail!("job is not completed");
-            }
-            e.remote_id.clone().context("missing remote id")?
+            j.get(&id)
+                .and_then(|e| e.remote_id.clone())
+                .context("missing remote id")?
         };
-        self.backend.lock().await.download(&remote, out).await
+        let out = out.unwrap_or_else(|| default_output(&job));
+        let out = if out.is_absolute() {
+            out
+        } else {
+            std::env::current_dir()?.join(out)
+        };
+        self.backend.lock().await.download(&remote, &out).await?;
+        Ok(out)
     }
 
     pub async fn retry(&self, id: Uuid) -> Result<Job> {
@@ -121,7 +178,7 @@ impl<B: Backend + Send + 'static> Service<B> {
                 }
                 let status = backend.lock().await.status(&remote).await;
                 if let Ok(s) = status {
-                    let terminal = matches!(s, JobStatus::Completed | JobStatus::Failed { .. });
+                    let terminal = s.is_terminal();
                     if let Some(x) = jobs.lock().await.get_mut(&id) {
                         x.status = s;
                     }
@@ -134,13 +191,48 @@ impl<B: Backend + Send + 'static> Service<B> {
         });
     }
 }
+/// `downloads/<name|prompt|image stem>-<id prefix>.glb`
+fn default_output(job: &Job) -> PathBuf {
+    let r = &job.request;
+    let stem = r
+        .image
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str());
+    let label = r
+        .name
+        .as_deref()
+        .or(Some(r.prompt.as_str()).filter(|p| !p.trim().is_empty()))
+        .or(stem)
+        .unwrap_or("model");
+    let mut slug = String::new();
+    for c in label.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.chars().count() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let short = &job.id.simple().to_string()[..8];
+    PathBuf::from("downloads").join(format!(
+        "{}-{short}.glb",
+        if slug.is_empty() { "model" } else { slug }
+    ))
+}
+
 fn validate(r: &GenerateRequest) -> Result<()> {
-    const OK: &[u32] = &[3000, 4000, 5000, 10000, 20000, 40000, 100000];
-    if !OK.contains(&r.polycount) {
-        bail!("unsupported polycount");
+    if !POLYCOUNTS.contains(&r.polycount) {
+        bail!(
+            "unsupported polycount {}; use one of {POLYCOUNTS:?}",
+            r.polycount
+        );
     }
     if r.image.is_none() && r.prompt.trim().is_empty() {
-        bail!("text-to-3d requires prompt");
+        bail!("provide `prompt` (Text-to-3D) or `image` (Image-to-3D)");
     }
     if let Some(p) = &r.image
         && !p.is_file()

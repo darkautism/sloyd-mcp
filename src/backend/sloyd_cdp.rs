@@ -236,17 +236,21 @@ impl SloydWebBackend {
                 .post(IMAGE_JOB)
                 .headers(Self::map(h)?)
                 .multipart(
-                    multipart::Form::new()
-                        .part("file", part)
-                        .text("options", "-lowpoly")
-                        .text("targetFaceCount", r.polycount.to_string())
-                        .text("textureResolution", "1k")
-                        .text("topology", "triangles"),
+                    r.image_fields()
+                        .into_iter()
+                        .fold(multipart::Form::new().part("file", part), |f, (k, v)| {
+                            f.text(k, v)
+                        }),
                 )
                 .send()
                 .await?
         } else {
-            self.http.post(TEXT_JOB).headers(Self::map(h)?).json(&serde_json::json!({"prompt":r.prompt,"genStyleId":"Auto","options":"-lowpoly","targetFaceCount":r.polycount,"textureResolution":"1k","topology":"triangles","tPose":false})).send().await?
+            self.http
+                .post(TEXT_JOB)
+                .headers(Self::map(h)?)
+                .json(&r.text_body())
+                .send()
+                .await?
         };
         let s = resp.status();
         let b = resp.text().await.unwrap_or_default();

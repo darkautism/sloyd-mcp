@@ -97,17 +97,16 @@ impl SloydHttpBackend {
                 .to_owned();
 
             let part = multipart::Part::bytes(bytes).file_name(filename);
+            let form = request
+                .image_fields()
+                .into_iter()
+                .fold(multipart::Form::new().part("file", part), |f, (k, v)| {
+                    f.text(k, v)
+                });
             self.http
                 .post(IMAGE_JOB)
                 .headers(headers)
-                .multipart(
-                    multipart::Form::new()
-                        .part("file", part)
-                        .text("options", "-lowpoly")
-                        .text("targetFaceCount", request.polycount.to_string())
-                        .text("textureResolution", "1k")
-                        .text("topology", "triangles"),
-                )
+                .multipart(form)
                 .send()
                 .await
                 .context("submit Sloyd Image-to-3D job")?
@@ -115,15 +114,7 @@ impl SloydHttpBackend {
             self.http
                 .post(TEXT_JOB)
                 .headers(headers)
-                .json(&serde_json::json!({
-                    "prompt": request.prompt,
-                    "genStyleId": "Auto",
-                    "options": "-lowpoly",
-                    "targetFaceCount": request.polycount,
-                    "textureResolution": "1k",
-                    "topology": "triangles",
-                    "tPose": false
-                }))
+                .json(&request.text_body())
                 .send()
                 .await
                 .context("submit Sloyd Text-to-3D job")?
