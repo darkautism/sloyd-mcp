@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rmcp::ServiceExt;
 use sloyd_mcp::{
     api::AgentApi,
-    backend::{Backend, sloyd_cdp::SloydWebBackend},
+    backend::{Backend, sloyd_cdp::SloydWebBackend, sloyd_http::SloydHttpBackend},
     cookies::import_cookie_file,
     mcp::SloydMcp,
     service::Service,
@@ -13,30 +13,41 @@ use std::{path::PathBuf, sync::Arc};
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Engine {
     Auto,
+    Http,
     Lightpanda,
     Chromium,
 }
+
 #[derive(Parser, Debug)]
 struct Cli {
-    #[arg(long,value_enum,default_value_t=Engine::Auto)]
+    #[arg(long, value_enum, default_value_t = Engine::Auto)]
     engine: Engine,
+
     #[arg(long, default_value = "/root/sloyd-mcp/bin/lightpanda")]
     lightpanda: PathBuf,
+
     #[arg(long, default_value = "/usr/bin/chromium")]
     chromium: PathBuf,
+
     #[arg(long, default_value = "/root/sloyd-mcp/state/chromium")]
     profile: PathBuf,
+
     #[arg(long, default_value = "/root/sloyd-mcp/state/cookies.json")]
     cookies: PathBuf,
+
     #[arg(long, default_value = "/root/sloyd-mcp/state/cache")]
     cache: PathBuf,
+
     #[arg(long, default_value_t = 9232)]
     port: u16,
+
     #[arg(long, default_value_t = false)]
     allow_guest: bool,
+
     #[command(subcommand)]
     command: Command,
 }
+
 #[derive(Subcommand, Debug)]
 enum Command {
     Doctor,
@@ -49,6 +60,7 @@ enum Command {
         concurrency: usize,
     },
 }
+
 async fn light(cli: &Cli) -> Result<SloydWebBackend> {
     SloydWebBackend::launch_lightpanda(
         &cli.lightpanda,
@@ -59,6 +71,7 @@ async fn light(cli: &Cli) -> Result<SloydWebBackend> {
     )
     .await
 }
+
 async fn chrome(cli: &Cli) -> Result<SloydWebBackend> {
     SloydWebBackend::launch_chromium(
         &cli.chromium,
@@ -69,33 +82,64 @@ async fn chrome(cli: &Cli) -> Result<SloydWebBackend> {
     )
     .await
 }
-async fn backend(cli: &Cli) -> Result<SloydWebBackend> {
-    match cli.engine {
-        Engine::Lightpanda => light(cli).await,
-        Engine::Chromium => chrome(cli).await,
-        Engine::Auto => match light(cli).await {
-            Ok(b) => Ok(b),
-            Err(_) => chrome(cli).await,
-        },
+
+async fn http(cli: &Cli) -> Result<SloydHttpBackend> {
+    SloydHttpBackend::new(&cli.cookies)
+}
+
+async fn run_mcp<B>(backend: B, concurrency: usize) -> Result<()>
+where
+    B: Backend + Send + 'static,
+{
+    let api: Arc<dyn AgentApi> = Arc::new(Service::new(backend, concurrency)?);
+    SloydMcp::new(api)
+        .serve(rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+async fn probe_auto(cli: &Cli) -> Result<bool> {
+    let mut backend = http(cli).await?;
+    match backend.session_probe().await {
+        Ok(true) => Ok(true),
+        Ok(false) | Err(_) => {
+            if cli.lightpanda.is_file() {
+                return light(cli).await?.session_probe().await;
+            }
+            if cli.chromium.is_file() {
+                return chrome(cli).await?.session_probe().await;
+            }
+            Ok(false)
+        }
     }
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
     match &cli.command {
         Command::Doctor => {
-            println!("lightpanda={}", cli.lightpanda.is_file());
-            println!("chromium={}", cli.chromium.is_file());
             println!("cookies={}", cli.cookies.display());
+            println!("browserless_http=true");
+            println!("lightpanda_fallback={}", cli.lightpanda.is_file());
+            println!("chromium_fallback={}", cli.chromium.is_file());
         }
         Command::SessionProbe => {
-            let b = backend(&cli).await?;
-            println!("authenticated={}", b.session_probe().await?);
+            let authenticated = match cli.engine {
+                Engine::Auto => probe_auto(&cli).await?,
+                Engine::Http => http(&cli).await?.session_probe().await?,
+                Engine::Lightpanda => light(&cli).await?.session_probe().await?,
+                Engine::Chromium => chrome(&cli).await?.session_probe().await?,
+            };
+            println!("authenticated={authenticated}");
         }
         Command::ImportCookies { source } => {
             let imported = import_cookie_file(source).await?;
-            if let Some(p) = cli.cookies.parent() {
-                tokio::fs::create_dir_all(p).await?;
+            if let Some(parent) = cli.cookies.parent() {
+                tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&cli.cookies, serde_json::to_vec_pretty(&imported.cookies)?).await?;
             #[cfg(unix)]
@@ -107,16 +151,32 @@ async fn main() -> Result<()> {
             println!("imported_sloyd_cookies={}", imported.cookies.len());
             println!("dropped_non_sloyd={}", imported.dropped_non_sloyd);
         }
-        Command::Mcp { concurrency } => {
-            let b = backend(&cli).await?;
-            b.health().await?;
-            let api: Arc<dyn AgentApi> = Arc::new(Service::new(b, *concurrency)?);
-            SloydMcp::new(api)
-                .serve(rmcp::transport::stdio())
-                .await?
-                .waiting()
-                .await?;
-        }
+        Command::Mcp { concurrency } => match cli.engine {
+            Engine::Http => {
+                let mut backend = http(&cli).await?;
+                if !backend.session_probe().await? {
+                    bail!("browserless Auth0 session is not authenticated");
+                }
+                run_mcp(backend, *concurrency).await?;
+            }
+            Engine::Lightpanda => run_mcp(light(&cli).await?, *concurrency).await?,
+            Engine::Chromium => run_mcp(chrome(&cli).await?, *concurrency).await?,
+            Engine::Auto => {
+                let mut backend = http(&cli).await?;
+                if backend.session_probe().await.unwrap_or(false) {
+                    run_mcp(backend, *concurrency).await?;
+                } else if cli.lightpanda.is_file() {
+                    run_mcp(light(&cli).await?, *concurrency).await?;
+                } else if cli.chromium.is_file() {
+                    run_mcp(chrome(&cli).await?, *concurrency).await?;
+                } else {
+                    bail!(
+                        "browserless Auth0 session is unavailable and no browser fallback exists"
+                    );
+                }
+            }
+        },
     }
+
     Ok(())
 }
