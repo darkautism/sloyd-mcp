@@ -1,61 +1,171 @@
 # sloyd-mcp
 
-Thin Rust MCP wrapper around a normal authenticated Sloyd Web session.
+Thin Rust MCP wrapper for Sloyd Web subscriptions.
 
-## What it exposes
+## Normal path: browserless
 
-Only four agent tools:
+The default path no longer needs Lightpanda or Chromium:
 
-- `generate` — Image-to-3D or Text-to-3D low-poly generation
+```text
+auth.sloyd.ai session cookies
+  -> Auth0 silent authorize (PKCE)
+  -> access token kept in RAM only
+  -> Sloyd /api/jobs/*
+  -> jobId
+  -> public GCS GLB
+```
+
+Browser backends remain optional fallbacks only.
+
+## MCP tools
+
+Exactly four tools are exposed:
+
+- `generate` — Image-to-3D or Text-to-3D
 - `status`
 - `download` — original GLB only
 - `retry`
 
-The wrapper captures the authenticated Web session headers in memory, then submits jobs directly to the same Sloyd Web backend. Completed GLBs are downloaded directly from Sloyd's public Google Cloud Storage object path.
+The service queues work instead of holding an MCP call open while Sloyd is generating. Concurrency is capped at 5.
 
-## Why Lightpanda
+## Required cookies
 
-On the same Sloyd Image-to-3D page we measured roughly 91 MB RSS for Lightpanda versus about 893 MB across Chromium's process tree. Chromium remains a fallback.
+For browserless operation the important cookies are the Auth0 server-session cookies from `auth.sloyd.ai`:
 
-## Bot verification
+- `auth0` — primary session cookie
+- `auth0_compat` — compatibility copy; recommended to keep as well
 
-Sloyd's current frontend includes Cloudflare Turnstile for its format-conversion endpoint. The observed Image-to-3D and Text-to-3D job endpoints do not use a Turnstile token. This wrapper downloads GLB directly and does not invoke the converter.
+One of those is sufficient for the importer/backend to attempt silent auth; keeping both is recommended.
 
-If a generation/status response starts requiring Turnstile/CAPTCHA, the wrapper fails closed instead of retrying or attempting to bypass verification.
+These are optional and are not treated as login credentials:
+
+- `did`
+- `did_compat`
+- `__cf_bm`
+
+These are not required by the browserless PKCE flow:
+
+- `auth0.<client>.is.authenticated`
+- `_legacy_auth0.<client>.is.authenticated`
+- Intercom, Mixpanel, Google Analytics, Partnero, advertising cookies
+
+Importing a full Cookie-Editor export is fine: the importer discards non-Sloyd domains, and the Auth0 client only sends the small Auth0 subset to `auth.sloyd.ai`.
 
 ## Setup
 
-Download a Lightpanda binary to `bin/lightpanda`, or use Chromium fallback.
-
-Import browser-exported Sloyd cookies:
+Build:
 
 ```bash
-cargo run -- import-cookies /path/to/cookies.json
-cargo run -- session-probe
+cd /root/sloyd-mcp
+cargo build --release
 ```
 
-Sloyd Plus:
+Import the cookie JSON exported from the browser:
 
 ```bash
-cargo run -- mcp --concurrency 2
+./target/release/sloyd-mcp import-cookies /path/to/sloyd-cookies.json
 ```
 
-Sloyd Pro:
+The normalized file is stored at:
+
+```text
+/root/sloyd-mcp/state/cookies.json
+```
+
+with Unix mode `0600`.
+
+Verify silent login without starting a browser:
 
 ```bash
-cargo run -- mcp --concurrency 5
+./target/release/sloyd-mcp --engine http session-probe
 ```
 
-Supported low-poly face counts are 3000, 4000, 5000, 10000, 20000, 40000, and 100000.
+Expected:
+
+```text
+authenticated=true
+```
+
+Start the MCP server for Sloyd Plus:
+
+```bash
+./target/release/sloyd-mcp mcp --concurrency 2
+```
+
+For Pro:
+
+```bash
+./target/release/sloyd-mcp mcp --concurrency 5
+```
+
+`Auto` is the default engine. It tries browserless Auth0 first, then falls back to Lightpanda or Chromium only if a fallback binary exists.
+
+## Claude Code
+
+Example project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "sloyd": {
+      "command": "/root/sloyd-mcp/target/release/sloyd-mcp",
+      "args": ["mcp", "--concurrency", "2"]
+    }
+  }
+}
+```
+
+## Codex
+
+Example `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.sloyd]
+command = "/root/sloyd-mcp/target/release/sloyd-mcp"
+args = ["mcp", "--concurrency", "2"]
+```
+
+## Low-poly settings
+
+Supported face counts:
+
+```text
+3000
+4000
+5000
+10000
+20000
+40000
+100000
+```
+
+Image-to-3D uploads the reference image directly to the same Sloyd Web job endpoint. Text-to-3D sends the prompt directly.
+
+## GLB download
+
+Completed models are fetched directly from Sloyd's documented/public object path:
+
+```text
+https://storage.googleapis.com/ai-services-quality/jobs/<jobId>.glb
+```
+
+The wrapper verifies the `glTF` magic before writing the result.
+
+It intentionally does not invoke Sloyd's format converter for FBX/OBJ/etc.
+
+## Turnstile / CAPTCHA
+
+Sloyd's current frontend contains Cloudflare Turnstile for its separate format-conversion flow. The observed Image-to-3D and Text-to-3D job paths do not require a Turnstile token.
+
+If generation or status ever starts returning Turnstile/CAPTCHA/challenge markers, the wrapper fails closed before retrying. It does not attempt to bypass interactive verification.
 
 ## Security
 
 - No plaintext password storage.
+- Access tokens are kept in RAM only.
+- Authorization headers are not intentionally logged.
 - Cookie import keeps only `*.sloyd.ai` cookies.
-- Cookie file is written with mode 0600 on Unix.
-- `state/`, binaries, downloads, keys, and environment files are git-ignored.
-- Authorization/session headers are kept in memory and never intentionally logged.
-
-## Scope
-
-This project automates normal Web subscription usage. It does not bypass Sloyd concurrency, fair-use, CAPTCHA, Turnstile, or subscription controls.
+- Browserless Auth0 sends only Auth0-related cookies to `auth.sloyd.ai`.
+- Cookie file mode is `0600` on Unix.
+- `state/`, downloads, browser binaries, `.env`, keys, and certificates are git-ignored.
+- The project does not bypass Sloyd concurrency, subscription, fair-use, CAPTCHA, or Turnstile controls.
