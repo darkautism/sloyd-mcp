@@ -19,14 +19,41 @@ Browser backends remain optional fallbacks only.
 
 ## MCP tools
 
-Exactly four tools are exposed:
+| Tool | Purpose |
+|---|---|
+| `generate` | Start Text-to-3D (`prompt`) or Image-to-3D (`image`); returns a job id immediately |
+| `download` | Wait for the job (default up to 300 s) and save the original GLB; returns the absolute path |
+| `status` | Job state + resolved settings; optional `wait_seconds` |
+| `list` | All jobs in this server session |
+| `retry` | Resubmit with identical settings (new job id) |
 
-- `generate` — Image-to-3D or Text-to-3D
-- `status`
-- `download` — original GLB only
-- `retry`
+Typical agent flow: call `generate` several times, then `download` each id. Every
+response includes a `next` hint, and invalid enum values are rejected with the list
+of allowed values.
 
-The service queues work instead of holding an MCP call open while Sloyd is generating. Concurrency is capped at 5.
+Jobs are queued rather than holding an MCP call open. Concurrency is capped at 5.
+
+### Generation settings
+
+Mirrors the app.sloyd.ai generate panel. Only `prompt` or `image` is required.
+
+| Param | Values | Default |
+|---|---|---|
+| `preset` | `game-highpoly`, `game-lowpoly`, `game-roblox`, `game-roblox-accessory`, `game-roblox-character`, `print-standard`, `print-multicolor`, `print-ultra`, `viz-standard`, `viz-ultra`, `visualization-env`, `custom` | `game-lowpoly` |
+| `style` (text only) | `Auto`, `Cartoon`, `CelShadedComic`, `ClayMorphic`, `Color3DPrint`, `CozyMobile`, `DetailedAnime`, `HandpaintedStylized`, `IsometricDiorama`, `PainterlyComic`, `Polygonal`, `Realistic`, `RetroCRT90s`, `Roblox`, `Sketch`, `StylizedAnime` | `Auto` |
+| `polycount` | 3000, 4000, 5000, 10000, 20000, 40000, 100000, 200000, 500000 | from preset |
+| `topology` | `auto`, `triangles`, `quads` | from preset |
+| `texture` | `none`, `512`, `1k`, `2k`, `4k` | from preset |
+| `t_pose` | bool | false |
+| `refine` (image only) | bool | false |
+| `license` | `private`, `cc-by-4.0` | `private` |
+| `name` | label for the default download filename | prompt |
+
+Presets set polycount/texture/topology defaults and the pipeline flag the web app
+sends (`-lowpoly` for game-lowpoly/roblox, `-3dprint` for print-standard/ultra,
+`-envmap` for visualization-env). Explicit `polycount`/`topology`/`texture` override
+the preset. The final `options` string is built like the web app:
+`[-refine][-tpose]<preset flag>-license-<license>`.
 
 ## Required cookies
 
@@ -124,22 +151,6 @@ Example `~/.codex/config.toml`:
 command = "/root/sloyd-mcp/target/release/sloyd-mcp"
 args = ["mcp", "--concurrency", "2"]
 ```
-
-## Low-poly settings
-
-Supported face counts:
-
-```text
-3000
-4000
-5000
-10000
-20000
-40000
-100000
-```
-
-Image-to-3D uploads the reference image directly to the same Sloyd Web job endpoint. Text-to-3D sends the prompt directly.
 
 ## GLB download
 
